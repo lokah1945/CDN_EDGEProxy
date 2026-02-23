@@ -1,9 +1,8 @@
 "use strict";
 
 class CacheReport {
-  constructor(storage, handler) {
+  constructor(storage) {
     this.storage = storage;
-    this.handler = handler;
     this._startTime = Date.now();
   }
 
@@ -12,9 +11,10 @@ class CacheReport {
     const uptime = ((Date.now() - this._startTime) / 60000).toFixed(1);
 
     console.log(`\n${"═".repeat(60)}`);
-    console.log(`  LOCAL CDN REPORT  (uptime: ${uptime} min)`);
+    console.log(`  CDN EdgeProxy REPORT  (uptime: ${uptime} min)`);
     console.log(`${"═".repeat(60)}`);
-    console.log(`  Storage   : ${s.entries || 0} entries, ${s.uniqueBlobs || 0} unique blobs`);
+    console.log(`  Entries : ${s.entries || 0} | Aliases: ${s.aliases || 0} | Unique blobs: ${s.uniqueBlobs || 0}`);
+    console.log(`  Disk    : ${((s.diskBytes || 0) / 1024 / 1024).toFixed(1)} MB`);
     console.log(`${"═".repeat(60)}\n`);
   }
 }
