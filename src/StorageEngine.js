@@ -10,28 +10,25 @@ class StorageEngine {
     this.dir = path.resolve(cacheConfig.dir || "data/cdn-cache");
     this.maxSize = cacheConfig.maxSize || 2199023255552;
     this.maxAge = cacheConfig.maxAge || 86400000;
-
-    // Stale TTL — validators survive much longer than body freshness.
-    // Derived internally: max(maxAge * 30, 7 days). No .env change needed.
     this.staleTTL = Math.max(this.maxAge * 30, 7 * 24 * 60 * 60 * 1000);
 
     this.indexPath = path.join(this.dir, "index.json");
     this.aliasIndexPath = path.join(this.dir, "alias-index.json");
     this.blobDir = path.join(this.dir, "blobs");
 
-    // In-memory index: cacheKey → meta
     this.index = new Map();
-    // Alias index: aliasKey → cacheKey (for cross-cachebuster revalidation)
     this.aliasIndex = new Map();
-    // In-memory blob cache: blobHash → Buffer
     this.blobs = new Map();
-    // Dedup tracker
     this.dedupSet = new Set();
+    this._dirty = false;
 
-    // Stats
     this.stats = {
       hits: 0, misses: 0, revalidated: 0,
       bytesFetched: 0, bytesServed: 0,
+      bytesWireFetched: 0,          // v4.1.1: compressed wire bytes
+      bytesWireServed: 0,           // v4.1.1: estimated wire savings
+      docHits: 0, docMisses: 0,    // v4.1.1: document-specific stats
+      docBytesSaved: 0,             // v4.1.1: bytes saved by 304 doc hits
       byOrigin: {},
       byType: {},
       topAssets: new Map()
@@ -41,42 +38,47 @@ class StorageEngine {
   async init() {
     fs.mkdirSync(this.blobDir, { recursive: true });
 
-    // Load main index
     if (fs.existsSync(this.indexPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.indexPath, "utf-8"));
-        for (const [key, val] of Object.entries(raw)) {
-          this.index.set(key, val);
-        }
+        for (const [key, val] of Object.entries(raw)) this.index.set(key, val);
       } catch (err) {
         log.warn("Storage", "Index corrupted, starting fresh");
       }
     }
 
-    // Load alias index
     if (fs.existsSync(this.aliasIndexPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.aliasIndexPath, "utf-8"));
-        for (const [key, val] of Object.entries(raw)) {
-          this.aliasIndex.set(key, val);
-        }
+        for (const [key, val] of Object.entries(raw)) this.aliasIndex.set(key, val);
       } catch (err) {
         log.warn("Storage", "Alias index corrupted, starting fresh");
       }
     }
 
-    // Pre-load blobs into RAM
+    // Pre-load blobs + remove orphan entries without blob file
     let diskSize = 0;
-    for (const [, meta] of this.index) {
+    const orphanKeys = [];
+    for (const [key, meta] of this.index) {
       const blobPath = this._blobPath(meta.blobHash);
-      if (fs.existsSync(blobPath) && !this.blobs.has(meta.blobHash)) {
-        const buf = fs.readFileSync(blobPath);
-        this.blobs.set(meta.blobHash, buf);
-        diskSize += buf.length;
+      if (fs.existsSync(blobPath)) {
+        if (!this.blobs.has(meta.blobHash)) {
+          const buf = fs.readFileSync(blobPath);
+          this.blobs.set(meta.blobHash, buf);
+          diskSize += buf.length;
+        }
+      } else {
+        orphanKeys.push(key);
       }
     }
+    if (orphanKeys.length > 0) {
+      for (const k of orphanKeys) this.index.delete(k);
+      this._saveIndex();
+      log.info("Storage", `Removed ${orphanKeys.length} orphan entries (missing blob files)`);
+    }
 
-    log.info("Storage", `Initialized: ${this.index.size} entries, ${this.aliasIndex.size} aliases, ${(diskSize / 1024 / 1024).toFixed(1)}MB on disk`);
+    const uniqueBlobs = new Set([...this.index.values()].map(m => m.blobHash)).size;
+    log.info("Storage", `Initialized: ${this.index.size} entries, ${this.aliasIndex.size} aliases, ${uniqueBlobs} unique blobs, ${(diskSize / 1024 / 1024).toFixed(1)}MB`);
     log.info("Storage", `Body TTL: ${(this.maxAge / 3600000).toFixed(1)}h | Stale validator TTL: ${(this.staleTTL / 86400000).toFixed(0)}d`);
   }
 
@@ -89,8 +91,7 @@ class StorageEngine {
   }
 
   _blobPath(hash) {
-    const shard = hash.substring(0, 2);
-    return path.join(this.blobDir, shard, hash);
+    return path.join(this.blobDir, hash.substring(0, 2), hash);
   }
 
   _totalRAMSize() {
@@ -99,32 +100,18 @@ class StorageEngine {
     return total;
   }
 
-  /**
-   * peekMeta — NON-DESTRUCTIVE read. Never deletes stale entries.
-   * Returns meta even if body TTL is expired (stale validators needed for 304).
-   */
   peekMeta(cacheKey) {
     return this.index.get(cacheKey) || null;
   }
 
-  /**
-   * peekMetaAllowStale — returns meta if within staleTTL.
-   * This is the key innovation: validators survive far beyond body freshness
-   * so we can still send If-None-Match / If-Modified-Since and get 304s.
-   */
   peekMetaAllowStale(cacheKey) {
     const meta = this.index.get(cacheKey);
     if (!meta) return null;
     const age = Date.now() - meta.storedAt;
     if (age < this.staleTTL) return meta;
-    // Truly expired beyond stale TTL — clean up
     return null;
   }
 
-  /**
-   * Look up alias index to find a related cache entry for revalidation.
-   * Returns meta from the alias's canonical key (if it has validators).
-   */
   peekAlias(aliasKey) {
     if (!aliasKey) return null;
     const canonKey = this.aliasIndex.get(aliasKey);
@@ -132,17 +119,11 @@ class StorageEngine {
     return this.peekMetaAllowStale(canonKey);
   }
 
-  /**
-   * Check if body is fresh (within CACHE_MAX_AGE).
-   */
   isFresh(meta) {
     if (!meta) return false;
     return (Date.now() - meta.storedAt) < this.maxAge;
   }
 
-  /**
-   * Check if meta has validators for conditional revalidation.
-   */
   hasValidators(meta) {
     return meta && (meta.etag || meta.lastModified);
   }
@@ -162,7 +143,7 @@ class StorageEngine {
     const meta = this.index.get(cacheKey);
     if (meta) {
       meta.storedAt = Date.now();
-      this._saveIndex();
+      this._dirty = true;
     }
   }
 
@@ -170,19 +151,14 @@ class StorageEngine {
     return this.dedupSet.has(cacheKey);
   }
 
-  getBlobHashShort(cacheKey) {
-    const meta = this.index.get(cacheKey);
-    return meta ? meta.blobHash.substring(0, 12) : "unknown";
-  }
-
+  /* ── Put: generic (CSS/JS/img/font) ── */
   async put(cacheKey, url, body, headers, resourceType, origin, aliasKey, requestHeaders) {
     const hash = this._blobHash(body);
     const isNewBlob = !this.blobs.has(hash);
 
     if (isNewBlob) {
       const blobPath = this._blobPath(hash);
-      const dir = path.dirname(blobPath);
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(path.dirname(blobPath), { recursive: true });
       const tmpPath = blobPath + ".tmp." + process.pid;
       fs.writeFileSync(tmpPath, body);
       fs.renameSync(tmpPath, blobPath);
@@ -191,9 +167,6 @@ class StorageEngine {
       this.dedupSet.add(cacheKey);
     }
 
-    // Determine vary-aware key suffix
-    const vary = headers["vary"] || null;
-
     this.index.set(cacheKey, {
       url,
       blobHash: hash,
@@ -201,47 +174,104 @@ class StorageEngine {
       headers: this._pickCacheHeaders(headers),
       etag: headers["etag"] || null,
       lastModified: headers["last-modified"] || null,
-      vary: vary || null,
+      vary: headers["vary"] || null,
       resourceType,
       origin,
       size: body.length
     });
 
-    // Register alias for cross-cachebuster revalidation
     if (aliasKey) {
       this.aliasIndex.set(aliasKey, cacheKey);
-      this._saveAliasIndex();
     }
 
-    this._saveIndex();
+    this._dirty = true;
+    this._debounceSave();
     this._evictIfNeeded();
   }
 
-  /**
-   * Pick safe headers for replay.
-   * CRITICAL: Drop content-encoding & content-length.
-   * Replaying these causes content corruption (Playwright decompresses bodies).
-   */
+  /* ── v4.1.1: Put Document (HTML with ETag/Last-Modified) ── */
+  async putDocument(cacheKey, url, body, headers) {
+    const hash = this._blobHash(body);
+    const isNewBlob = !this.blobs.has(hash);
+
+    if (isNewBlob) {
+      const blobPath = this._blobPath(hash);
+      fs.mkdirSync(path.dirname(blobPath), { recursive: true });
+      const tmpPath = blobPath + ".tmp." + process.pid;
+      fs.writeFileSync(tmpPath, body);
+      fs.renameSync(tmpPath, blobPath);
+      this.blobs.set(hash, body);
+    }
+
+    this.index.set(cacheKey, {
+      url,
+      blobHash: hash,
+      storedAt: Date.now(),
+      headers: this._pickDocHeaders(headers),
+      etag: headers["etag"] || null,
+      lastModified: headers["last-modified"] || null,
+      vary: headers["vary"] || null,
+      resourceType: "document",
+      origin: "document",
+      size: body.length
+    });
+
+    this._dirty = true;
+    this._debounceSave();
+  }
+
+  _pickDocHeaders(headers) {
+    const keep = [
+      "content-type", "cache-control", "etag", "last-modified", "vary",
+      "access-control-allow-origin", "access-control-allow-credentials",
+      "access-control-allow-methods", "access-control-allow-headers",
+      "access-control-expose-headers", "x-content-type-options",
+      "content-security-policy", "x-frame-options",
+      "set-cookie", "link",
+    ];
+    const result = {};
+    for (const k of keep) {
+      if (headers[k]) result[k] = headers[k];
+    }
+    return result;
+  }
+
+  _debounceSave() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      if (this._dirty) {
+        this._saveIndex();
+        this._saveAliasIndex();
+        this._dirty = false;
+      }
+    }, 2000);
+  }
+
+  flush() {
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
+    }
+    if (this._dirty) {
+      this._saveIndex();
+      this._saveAliasIndex();
+      this._dirty = false;
+    }
+  }
+
   _pickCacheHeaders(headers) {
     const keep = [
-      "content-type",
-      "cache-control",
-      "etag",
-      "last-modified",
-      "vary",
-      "access-control-allow-origin",
-      "access-control-allow-credentials",
-      "access-control-allow-methods",
-      "access-control-allow-headers",
-      "access-control-expose-headers",
-      "timing-allow-origin",
+      "content-type", "cache-control", "etag", "last-modified", "vary",
+      "access-control-allow-origin", "access-control-allow-credentials",
+      "access-control-allow-methods", "access-control-allow-headers",
+      "access-control-expose-headers", "timing-allow-origin",
       "x-content-type-options",
     ];
     const result = {};
     for (const k of keep) {
       if (headers[k]) result[k] = headers[k];
     }
-    // NEVER include content-encoding or content-length
     return result;
   }
 
@@ -266,12 +296,15 @@ class StorageEngine {
     for (const [, meta] of this.index) totalSize += (meta.size || 0);
     if (totalSize <= this.maxSize) return;
 
+    log.info("Storage", `Eviction triggered: ${(totalSize / 1024 / 1024).toFixed(1)}MB > ${(this.maxSize / 1024 / 1024).toFixed(1)}MB limit`);
     const entries = [...this.index.entries()].sort((a, b) => a[1].storedAt - b[1].storedAt);
+
+    let evicted = 0;
     while (totalSize > this.maxSize * 0.9 && entries.length > 0) {
       const [key, meta] = entries.shift();
       totalSize -= (meta.size || 0);
       this.index.delete(key);
-      // Refcount-aware blob deletion
+      evicted++;
       const stillUsed = [...this.index.values()].some(m => m.blobHash === meta.blobHash);
       if (!stillUsed) {
         this.blobs.delete(meta.blobHash);
@@ -280,32 +313,52 @@ class StorageEngine {
       }
     }
     this._saveIndex();
-    log.info("Storage", `Eviction complete. ${this.index.size} entries remaining.`);
+    log.info("Storage", `Evicted ${evicted} entries. ${this.index.size} remaining.`);
   }
 
-  // --- Stats ---
-  recordHit(url, resourceType, origin, bytes) {
+  /* ── Stats: generic assets ── */
+
+  recordHit(url, resourceType, origin, bytes, wireBytes) {
     this.stats.hits++;
     this.stats.bytesServed += bytes;
+    this.stats.bytesWireServed += (wireBytes || bytes);
     this._trackOrigin(origin, "hit", bytes);
     this._trackType(resourceType, "hit");
     this._trackTopAsset(url, bytes);
   }
 
-  recordRevalidated(url, resourceType, origin, bytes) {
+  recordRevalidated(url, resourceType, origin, bytes, wireBytes) {
     this.stats.revalidated++;
     this.stats.hits++;
     this.stats.bytesServed += bytes;
+    this.stats.bytesWireServed += (wireBytes || bytes);
     this._trackOrigin(origin, "hit", bytes);
     this._trackType(resourceType, "hit");
     this._trackTopAsset(url, bytes);
   }
 
-  recordMiss(url, resourceType, origin, bytes) {
+  recordMiss(url, resourceType, origin, bytes, wireBytes) {
     this.stats.misses++;
     this.stats.bytesFetched += bytes;
+    this.stats.bytesWireFetched += (wireBytes || bytes);
     this._trackOrigin(origin, "miss", bytes);
     this._trackType(resourceType, "miss");
+  }
+
+  /* ── v4.1.1: Stats: document cache ── */
+
+  recordDocHit(url, bytes) {
+    this.stats.docHits++;
+    this.stats.docBytesSaved += bytes;
+    this.stats.bytesServed += bytes;
+    this._trackType("document", "hit");
+  }
+
+  recordDocMiss(url, bytes, wireBytes) {
+    this.stats.docMisses++;
+    this.stats.bytesFetched += bytes;
+    this.stats.bytesWireFetched += (wireBytes || bytes);
+    this._trackType("document", "miss");
   }
 
   _trackOrigin(origin, hitOrMiss, bytes) {
@@ -323,11 +376,24 @@ class StorageEngine {
   }
 
   _trackTopAsset(url, bytes) {
-    const short = url.substring(0, 80);
+    const short = url.substring(0, 120);
     const cur = this.stats.topAssets.get(short) || { count: 0, bytes: 0 };
     cur.count++;
     cur.bytes += bytes;
     this.stats.topAssets.set(short, cur);
+  }
+
+  getStats() {
+    const uniqueBlobs = new Set([...this.index.values()].map(m => m.blobHash)).size;
+    let diskBytes = 0;
+    for (const [, meta] of this.index) diskBytes += (meta.size || 0);
+    return {
+      entries: this.index.size,
+      aliases: this.aliasIndex.size,
+      uniqueBlobs,
+      diskBytes,
+      dedupHits: this.dedupSet.size,
+    };
   }
 
   getReport() {
@@ -341,34 +407,56 @@ class StorageEngine {
     for (const [, meta] of this.index) diskSize += (meta.size || 0);
     const diskMB = (diskSize / 1024 / 1024).toFixed(1);
 
-    let report = `Cache entries: ${this.index.size} | Aliases: ${this.aliasIndex.size} | Unique blobs: ${uniqueBlobs} | Dedup hits: ${dedups}\n`;
-    report += `RAM blobs: ${this.blobs.size} (${ramMB}MB) | Disk: ${diskMB}MB\n`;
-    report += `HIT: ${this.stats.hits} | MISS: ${this.stats.misses} | 304-revalidated: ${this.stats.revalidated} | Ratio: ${ratio}%\n`;
-    report += `Bytes fetched (quota used): ${(this.stats.bytesFetched / 1024 / 1024).toFixed(1)} MB\n`;
-    report += `Bytes served from cache: ${(this.stats.bytesServed / 1024 / 1024).toFixed(1)} MB\n`;
-    report += `QUOTA SAVED: ${(this.stats.bytesServed / 1024 / 1024).toFixed(1)} MB\n`;
+    const fetchedMB = (this.stats.bytesFetched / 1024 / 1024).toFixed(1);
+    const servedMB = (this.stats.bytesServed / 1024 / 1024).toFixed(1);
+    const wireFetchedMB = (this.stats.bytesWireFetched / 1024 / 1024).toFixed(1);
+    const wireServedMB = (this.stats.bytesWireServed / 1024 / 1024).toFixed(1);
 
-    report += `--- By Origin ---\n`;
+    const fetchRatio = this.stats.bytesFetched > 0
+      ? (this.stats.bytesServed / this.stats.bytesFetched).toFixed(1)
+      : "∞";
+    const wireRatio = this.stats.bytesWireFetched > 0
+      ? (this.stats.bytesWireServed / this.stats.bytesWireFetched).toFixed(1)
+      : "∞";
+
+    let r = "";
+    r += `${"═".repeat(60)}\n`;
+    r += `  CDN EdgeProxy CACHE REPORT\n`;
+    r += `${"═".repeat(60)}\n`;
+    r += `  Cache entries: ${this.index.size} | Aliases: ${this.aliasIndex.size} | Unique blobs: ${uniqueBlobs} | Dedup: ${dedups}\n`;
+    r += `  RAM blobs: ${this.blobs.size} (${ramMB}MB) | Disk: ${diskMB}MB\n`;
+    r += `  HIT: ${this.stats.hits} | MISS: ${this.stats.misses} | 304-reval: ${this.stats.revalidated} | Ratio: ${ratio}%\n`;
+    r += `\n`;
+    r += `  Bandwidth (Resource / Uncompressed):\n`;
+    r += `    Fetched: ${fetchedMB} MB | Served: ${servedMB} MB | Ratio: ${fetchRatio}:1\n`;
+    r += `  Bandwidth (Wire / Compressed est.):\n`;
+    r += `    Fetched: ~${wireFetchedMB} MB | Served: ~${wireServedMB} MB | Ratio: ~${wireRatio}:1\n`;
+    r += `\n`;
+    r += `  Document Cache:\n`;
+    r += `    DOC-HIT (304): ${this.stats.docHits} | DOC-MISS (200): ${this.stats.docMisses} | Saved: ${(this.stats.docBytesSaved / 1024 / 1024).toFixed(1)} MB\n`;
+
+    r += `\n  --- By Origin ---\n`;
     for (const [origin, s] of Object.entries(this.stats.byOrigin)) {
-      report += `  ${origin}: HIT ${s.hit} | MISS ${s.miss} | Saved ${(s.saved / 1024 / 1024).toFixed(1)} MB | Fetched ${(s.fetched / 1024 / 1024).toFixed(1)} MB\n`;
+      r += `    ${origin}: HIT ${s.hit} | MISS ${s.miss} | Saved ${(s.saved / 1024 / 1024).toFixed(1)} MB | Fetched ${(s.fetched / 1024 / 1024).toFixed(1)} MB\n`;
     }
 
-    report += `--- By Resource Type ---\n`;
+    r += `  --- By Resource Type ---\n`;
     for (const [type, s] of Object.entries(this.stats.byType)) {
-      report += `  ${type}: HIT ${s.hit} | MISS ${s.miss}\n`;
+      r += `    ${type}: HIT ${s.hit} | MISS ${s.miss}\n`;
     }
 
     const topAssets = [...this.stats.topAssets.entries()]
       .sort((a, b) => b[1].bytes - a[1].bytes)
       .slice(0, 10);
     if (topAssets.length > 0) {
-      report += `--- Top 10 Cached Assets ---\n`;
+      r += `  --- Top 10 Cached Assets ---\n`;
       for (const [url, info] of topAssets) {
-        report += `  ${info.count}x ${(info.bytes / 1024).toFixed(1)} KB ${url}\n`;
+        r += `    ${info.count}x ${(info.bytes / 1024).toFixed(1)} KB ${url}\n`;
       }
     }
 
-    return report;
+    r += `${"═".repeat(60)}`;
+    return r;
   }
 }
 
