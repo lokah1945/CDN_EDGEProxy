@@ -17,6 +17,7 @@ class BrowserRunner {
     this.storage = null;
     this.reportInterval = null;
     this.disposableProfileDir = null;
+    this._stopping = false;
   }
 
   _getBrowserType() {
@@ -34,49 +35,48 @@ class BrowserRunner {
     }
   }
 
-  /**
-   * Generate a unique disposable profile directory per run.
-   * Format: data/tmp-profiles/<browser>/<timestamp>-<random>/
-   * This directory is deleted on stop().
-   */
   _createDisposableProfileDir() {
     const rand = crypto.randomBytes(4).toString("hex");
     const ts = Date.now();
     const dir = path.resolve("data", "tmp-profiles", this.browserName, `${ts}-${rand}`);
     fs.mkdirSync(dir, { recursive: true });
     this.disposableProfileDir = dir;
-    log.info("Profile", `Disposable profile: ${dir}`);
+    log.debug("Profile", `Disposable profile: ${dir}`);
     return dir;
   }
 
-  /**
-   * Recursively remove a directory (rm -rf equivalent).
-   */
   _rmrf(dir) {
     if (!dir || !fs.existsSync(dir)) return;
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      log.info("Profile", `Cleaned up: ${dir}`);
+      log.debug("Profile", `Cleaned up: ${dir}`);
     } catch (err) {
       log.warn("Profile", `Cleanup failed for ${dir}: ${err.message}`);
     }
   }
 
   async start() {
-    // Phase 1: Init storage (shared CDN cache — persists across runs)
-    log.info("Phase 1: Initializing storage engine...");
+    // Phase 1: Storage
+    log.info("Phase 1/3: Initializing storage engine...");
     this.storage = new StorageEngine(this.config.cache);
     await this.storage.init();
 
-    // Phase 2: Create disposable profile & launch browser
-    log.info("Phase 2: Launching browser with disposable profile...");
+    // Phase 2: Browser
+    log.info("Phase 2/3: Launching browser...");
     const profileDir = this._createDisposableProfileDir();
     const browserType = this._getBrowserType();
     const launchOpts = {
       headless: false,
       args: this.browserName !== "firefox"
-        ? ["--disable-blink-features=AutomationControlled"]
-        : undefined
+        ? [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+          ]
+        : undefined,
+      ignoreDefaultArgs: this.browserName !== "firefox"
+        ? ["--enable-automation"]
+        : undefined,
     };
 
     const channel = this._getChannel();
@@ -86,51 +86,42 @@ class BrowserRunner {
       ...launchOpts,
       serviceWorkers: this.config.browser.serviceWorkers,
       viewport: null,
-      ignoreHTTPSErrors: true
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,
     });
 
-    // Collect all matchDomains for the classifier
-    const allMatchDomains = [];
-    for (const t of this.config.targets) {
-      if (t.matchDomains) allMatchDomains.push(...t.matchDomains);
-    }
+    // v4.1: Auto-close detection — if user closes all tabs, shut down gracefully
+    this.context.on("close", () => {
+      if (!this._stopping) {
+        log.info("Browser closed by user. Shutting down...");
+        this.stop().then(() => process.exit(0));
+      }
+    });
 
-    const classifier = new TrafficClassifier(this.config.routing, allMatchDomains);
+    // Phase 3: Route interception
+    log.info("Phase 3/3: Installing route interception...");
+    const classifier = new TrafficClassifier(this.config.routing);
     const handler = new RequestHandler(this.storage, classifier, this.config.cache);
 
-    log.info("Phase 3: Starting cache report...");
-    this._startReport();
-
-    // Install context-level route interception
     await this.context.route("**/*", async (route) => {
       try {
         await handler.handle(route);
       } catch (err) {
-        log.warn("Handler", `Fetch failed for ${route.request().url().substring(0, 80)}`, err.message);
+        log.warn("Handler", `${route.request().url().substring(0, 80)}: ${err.message}`);
         try { await route.continue(); } catch (_) {}
       }
     });
 
-    // Open tabs for each target
-    for (let i = 0; i < this.config.targets.length; i++) {
-      const target = this.config.targets[i];
-      log.info(`Phase ${4 + i}: Setting up target ${target.label} → ${target.entryUrl}`);
+    // Start periodic cache report
+    this._startReport();
 
-      let page;
-      const pages = this.context.pages();
-      if (i === 0 && pages.length > 0) {
-        page = pages[0];
-      } else {
-        page = await this.context.newPage();
-      }
-
-      log.info(`Phase ${5 + i}: Navigating to ${target.entryUrl}...`);
-      try {
-        await page.goto(target.entryUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      } catch (err) {
-        log.warn("Navigation", `Timeout for ${target.label}: ${err.message}`);
-      }
-    }
+    // v4.1: No auto-navigate. Browser opens blank — user browses freely.
+    log.info("────────────────────────────────────────────");
+    log.info("CDN EdgeProxy READY — browse any website.");
+    log.info("All static assets (CSS, JS, images, fonts) are cached.");
+    log.info("Ad auction & beacon traffic flows through untouched.");
+    log.info("Press Ctrl+C to stop.");
+    log.info("────────────────────────────────────────────");
   }
 
   _startReport() {
@@ -139,19 +130,32 @@ class BrowserRunner {
         const report = this.storage.getReport();
         log.info("CACHE REPORT", "\n" + report);
       }
-    }, 30000);
+    }, 30_000);
   }
 
   async stop() {
+    if (this._stopping) return;
+    this._stopping = true;
+
     if (this.reportInterval) clearInterval(this.reportInterval);
+
+    // Print final report
     if (this.storage) {
       const report = this.storage.getReport();
       log.info("FINAL CACHE REPORT", "\n" + report);
     }
+
+    // Flush index to disk
+    if (this.storage) {
+      try { this.storage.flush(); } catch (_) {}
+    }
+
+    // Close browser
     if (this.context) {
       try { await this.context.close(); } catch (_) {}
     }
-    // Clean up disposable profile directory
+
+    // Clean disposable profile
     if (this.disposableProfileDir) {
       this._rmrf(this.disposableProfileDir);
     }

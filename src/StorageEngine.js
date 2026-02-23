@@ -10,25 +10,18 @@ class StorageEngine {
     this.dir = path.resolve(cacheConfig.dir || "data/cdn-cache");
     this.maxSize = cacheConfig.maxSize || 2199023255552;
     this.maxAge = cacheConfig.maxAge || 86400000;
-
-    // Stale TTL — validators survive much longer than body freshness.
-    // Derived internally: max(maxAge * 30, 7 days). No .env change needed.
     this.staleTTL = Math.max(this.maxAge * 30, 7 * 24 * 60 * 60 * 1000);
 
     this.indexPath = path.join(this.dir, "index.json");
     this.aliasIndexPath = path.join(this.dir, "alias-index.json");
     this.blobDir = path.join(this.dir, "blobs");
 
-    // In-memory index: cacheKey → meta
     this.index = new Map();
-    // Alias index: aliasKey → cacheKey (for cross-cachebuster revalidation)
     this.aliasIndex = new Map();
-    // In-memory blob cache: blobHash → Buffer
     this.blobs = new Map();
-    // Dedup tracker
     this.dedupSet = new Set();
+    this._dirty = false;
 
-    // Stats
     this.stats = {
       hits: 0, misses: 0, revalidated: 0,
       bytesFetched: 0, bytesServed: 0,
@@ -41,42 +34,48 @@ class StorageEngine {
   async init() {
     fs.mkdirSync(this.blobDir, { recursive: true });
 
-    // Load main index
     if (fs.existsSync(this.indexPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.indexPath, "utf-8"));
-        for (const [key, val] of Object.entries(raw)) {
-          this.index.set(key, val);
-        }
+        for (const [key, val] of Object.entries(raw)) this.index.set(key, val);
       } catch (err) {
         log.warn("Storage", "Index corrupted, starting fresh");
       }
     }
 
-    // Load alias index
     if (fs.existsSync(this.aliasIndexPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.aliasIndexPath, "utf-8"));
-        for (const [key, val] of Object.entries(raw)) {
-          this.aliasIndex.set(key, val);
-        }
+        for (const [key, val] of Object.entries(raw)) this.aliasIndex.set(key, val);
       } catch (err) {
         log.warn("Storage", "Alias index corrupted, starting fresh");
       }
     }
 
-    // Pre-load blobs into RAM
+    // Pre-load blobs + remove orphan entries without blob file
     let diskSize = 0;
-    for (const [, meta] of this.index) {
+    const orphanKeys = [];
+    for (const [key, meta] of this.index) {
       const blobPath = this._blobPath(meta.blobHash);
-      if (fs.existsSync(blobPath) && !this.blobs.has(meta.blobHash)) {
-        const buf = fs.readFileSync(blobPath);
-        this.blobs.set(meta.blobHash, buf);
-        diskSize += buf.length;
+      if (fs.existsSync(blobPath)) {
+        if (!this.blobs.has(meta.blobHash)) {
+          const buf = fs.readFileSync(blobPath);
+          this.blobs.set(meta.blobHash, buf);
+          diskSize += buf.length;
+        }
+      } else {
+        orphanKeys.push(key);
       }
     }
+    // v4.1: Clean orphan entries at startup
+    if (orphanKeys.length > 0) {
+      for (const k of orphanKeys) this.index.delete(k);
+      this._saveIndex();
+      log.info("Storage", `Removed ${orphanKeys.length} orphan entries (missing blob files)`);
+    }
 
-    log.info("Storage", `Initialized: ${this.index.size} entries, ${this.aliasIndex.size} aliases, ${(diskSize / 1024 / 1024).toFixed(1)}MB on disk`);
+    const uniqueBlobs = new Set([...this.index.values()].map(m => m.blobHash)).size;
+    log.info("Storage", `Initialized: ${this.index.size} entries, ${this.aliasIndex.size} aliases, ${uniqueBlobs} unique blobs, ${(diskSize / 1024 / 1024).toFixed(1)}MB`);
     log.info("Storage", `Body TTL: ${(this.maxAge / 3600000).toFixed(1)}h | Stale validator TTL: ${(this.staleTTL / 86400000).toFixed(0)}d`);
   }
 
@@ -89,8 +88,7 @@ class StorageEngine {
   }
 
   _blobPath(hash) {
-    const shard = hash.substring(0, 2);
-    return path.join(this.blobDir, shard, hash);
+    return path.join(this.blobDir, hash.substring(0, 2), hash);
   }
 
   _totalRAMSize() {
@@ -99,32 +97,18 @@ class StorageEngine {
     return total;
   }
 
-  /**
-   * peekMeta — NON-DESTRUCTIVE read. Never deletes stale entries.
-   * Returns meta even if body TTL is expired (stale validators needed for 304).
-   */
   peekMeta(cacheKey) {
     return this.index.get(cacheKey) || null;
   }
 
-  /**
-   * peekMetaAllowStale — returns meta if within staleTTL.
-   * This is the key innovation: validators survive far beyond body freshness
-   * so we can still send If-None-Match / If-Modified-Since and get 304s.
-   */
   peekMetaAllowStale(cacheKey) {
     const meta = this.index.get(cacheKey);
     if (!meta) return null;
     const age = Date.now() - meta.storedAt;
     if (age < this.staleTTL) return meta;
-    // Truly expired beyond stale TTL — clean up
     return null;
   }
 
-  /**
-   * Look up alias index to find a related cache entry for revalidation.
-   * Returns meta from the alias's canonical key (if it has validators).
-   */
   peekAlias(aliasKey) {
     if (!aliasKey) return null;
     const canonKey = this.aliasIndex.get(aliasKey);
@@ -132,17 +116,11 @@ class StorageEngine {
     return this.peekMetaAllowStale(canonKey);
   }
 
-  /**
-   * Check if body is fresh (within CACHE_MAX_AGE).
-   */
   isFresh(meta) {
     if (!meta) return false;
     return (Date.now() - meta.storedAt) < this.maxAge;
   }
 
-  /**
-   * Check if meta has validators for conditional revalidation.
-   */
   hasValidators(meta) {
     return meta && (meta.etag || meta.lastModified);
   }
@@ -162,17 +140,12 @@ class StorageEngine {
     const meta = this.index.get(cacheKey);
     if (meta) {
       meta.storedAt = Date.now();
-      this._saveIndex();
+      this._dirty = true;
     }
   }
 
   isDedup(cacheKey) {
     return this.dedupSet.has(cacheKey);
-  }
-
-  getBlobHashShort(cacheKey) {
-    const meta = this.index.get(cacheKey);
-    return meta ? meta.blobHash.substring(0, 12) : "unknown";
   }
 
   async put(cacheKey, url, body, headers, resourceType, origin, aliasKey, requestHeaders) {
@@ -181,8 +154,7 @@ class StorageEngine {
 
     if (isNewBlob) {
       const blobPath = this._blobPath(hash);
-      const dir = path.dirname(blobPath);
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(path.dirname(blobPath), { recursive: true });
       const tmpPath = blobPath + ".tmp." + process.pid;
       fs.writeFileSync(tmpPath, body);
       fs.renameSync(tmpPath, blobPath);
@@ -191,9 +163,6 @@ class StorageEngine {
       this.dedupSet.add(cacheKey);
     }
 
-    // Determine vary-aware key suffix
-    const vary = headers["vary"] || null;
-
     this.index.set(cacheKey, {
       url,
       blobHash: hash,
@@ -201,47 +170,63 @@ class StorageEngine {
       headers: this._pickCacheHeaders(headers),
       etag: headers["etag"] || null,
       lastModified: headers["last-modified"] || null,
-      vary: vary || null,
+      vary: headers["vary"] || null,
       resourceType,
       origin,
       size: body.length
     });
 
-    // Register alias for cross-cachebuster revalidation
     if (aliasKey) {
       this.aliasIndex.set(aliasKey, cacheKey);
-      this._saveAliasIndex();
     }
 
-    this._saveIndex();
+    this._dirty = true;
+    this._debounceSave();
     this._evictIfNeeded();
   }
 
   /**
-   * Pick safe headers for replay.
-   * CRITICAL: Drop content-encoding & content-length.
-   * Replaying these causes content corruption (Playwright decompresses bodies).
+   * v4.1: Debounced save — batch multiple rapid puts into one disk write.
    */
+  _debounceSave() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      if (this._dirty) {
+        this._saveIndex();
+        this._saveAliasIndex();
+        this._dirty = false;
+      }
+    }, 2000);
+  }
+
+  /**
+   * v4.1: Explicit flush — called on shutdown to ensure nothing is lost.
+   */
+  flush() {
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
+    }
+    if (this._dirty) {
+      this._saveIndex();
+      this._saveAliasIndex();
+      this._dirty = false;
+    }
+  }
+
   _pickCacheHeaders(headers) {
     const keep = [
-      "content-type",
-      "cache-control",
-      "etag",
-      "last-modified",
-      "vary",
-      "access-control-allow-origin",
-      "access-control-allow-credentials",
-      "access-control-allow-methods",
-      "access-control-allow-headers",
-      "access-control-expose-headers",
-      "timing-allow-origin",
+      "content-type", "cache-control", "etag", "last-modified", "vary",
+      "access-control-allow-origin", "access-control-allow-credentials",
+      "access-control-allow-methods", "access-control-allow-headers",
+      "access-control-expose-headers", "timing-allow-origin",
       "x-content-type-options",
     ];
     const result = {};
     for (const k of keep) {
       if (headers[k]) result[k] = headers[k];
     }
-    // NEVER include content-encoding or content-length
     return result;
   }
 
@@ -266,12 +251,15 @@ class StorageEngine {
     for (const [, meta] of this.index) totalSize += (meta.size || 0);
     if (totalSize <= this.maxSize) return;
 
+    log.info("Storage", `Eviction triggered: ${(totalSize / 1024 / 1024).toFixed(1)}MB > ${(this.maxSize / 1024 / 1024).toFixed(1)}MB limit`);
     const entries = [...this.index.entries()].sort((a, b) => a[1].storedAt - b[1].storedAt);
+
+    let evicted = 0;
     while (totalSize > this.maxSize * 0.9 && entries.length > 0) {
       const [key, meta] = entries.shift();
       totalSize -= (meta.size || 0);
       this.index.delete(key);
-      // Refcount-aware blob deletion
+      evicted++;
       const stillUsed = [...this.index.values()].some(m => m.blobHash === meta.blobHash);
       if (!stillUsed) {
         this.blobs.delete(meta.blobHash);
@@ -280,10 +268,10 @@ class StorageEngine {
       }
     }
     this._saveIndex();
-    log.info("Storage", `Eviction complete. ${this.index.size} entries remaining.`);
+    log.info("Storage", `Evicted ${evicted} entries. ${this.index.size} remaining.`);
   }
 
-  // --- Stats ---
+  // ─── Stats ───
   recordHit(url, resourceType, origin, bytes) {
     this.stats.hits++;
     this.stats.bytesServed += bytes;
@@ -323,11 +311,27 @@ class StorageEngine {
   }
 
   _trackTopAsset(url, bytes) {
-    const short = url.substring(0, 80);
+    const short = url.substring(0, 120);
     const cur = this.stats.topAssets.get(short) || { count: 0, bytes: 0 };
     cur.count++;
     cur.bytes += bytes;
     this.stats.topAssets.set(short, cur);
+  }
+
+  /**
+   * v4.1: getStats() — for CacheReport compatibility.
+   */
+  getStats() {
+    const uniqueBlobs = new Set([...this.index.values()].map(m => m.blobHash)).size;
+    let diskBytes = 0;
+    for (const [, meta] of this.index) diskBytes += (meta.size || 0);
+    return {
+      entries: this.index.size,
+      aliases: this.aliasIndex.size,
+      uniqueBlobs,
+      diskBytes,
+      dedupHits: this.dedupSet.size,
+    };
   }
 
   getReport() {
