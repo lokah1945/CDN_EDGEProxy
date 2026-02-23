@@ -3,6 +3,16 @@
 const { log } = require("./logger");
 const { URLNormalizer } = require("./URLNormalizer");
 
+/**
+ * RequestHandler v4.0.0
+ *
+ * Key upgrades from v3.1.3:
+ *   - CSS and JS cached aggressively (same tier as images/fonts)
+ *   - Via header added to outgoing requests (origin sees CDN-like traffic)
+ *   - Universal: works on any website without pre-configured targets
+ *   - document (HTML) still bypasses cache (always fresh from origin)
+ *   - Stale-while-revalidate: serve stale body + conditional revalidation
+ */
 class RequestHandler {
   constructor(storage, classifier, cacheConfig) {
     this.storage = storage;
@@ -11,26 +21,55 @@ class RequestHandler {
     this.normalizer = new URLNormalizer();
   }
 
+  /**
+   * Cacheable resource types — v4 is aggressive: CSS and JS are HIGH priority cache targets.
+   */
+  _isCacheableType(resourceType) {
+    switch (resourceType) {
+      case "stylesheet":
+      case "script":
+      case "image":
+      case "font":
+      case "media":
+        return true;
+      case "fetch":
+      case "xhr":
+        return true; // will be filtered by content-type after fetching
+      default:
+        return false;
+    }
+  }
+
   async handle(route) {
     const request = route.request();
     const url = request.url();
     const resourceType = request.resourceType();
 
-    // Skip non-GET and navigation requests
-    if (request.method() !== "GET" || resourceType === "document") {
+    // Skip non-GET requests — POST/PUT/DELETE must always go to origin
+    if (request.method() !== "GET") {
+      return route.continue();
+    }
+
+    // ALWAYS bypass document (HTML) — user must always see fresh content
+    if (resourceType === "document") {
+      return route.continue();
+    }
+
+    // Skip non-cacheable resource types early
+    if (!this._isCacheableType(resourceType)) {
       return route.continue();
     }
 
     // Classify the request
     const classification = this.classifier.classify(url, resourceType);
 
-    // Class A & B: bypass (auction/decisioning, measurement/beacon)
+    // Class A (auction/decisioning): BYPASS — preserve ad revenue
+    // Class B (measurement/beacon): BYPASS — preserve analytics
     if (classification.class === "A" || classification.class === "B") {
       return route.continue();
     }
 
-    // For fetch/xhr: we need to check content-type AFTER fetching.
-    // Scripts by themselves are Class C but fetch/xhr JSON should NOT be cached.
+    // ═══ CLASS C: CACHE PATH ═══
     const isFetchXhr = (resourceType === "fetch" || resourceType === "xhr");
 
     // Build cache keys
@@ -41,26 +80,24 @@ class RequestHandler {
 
     // ─── CACHE LOOKUP ───
     let meta = this.storage.peekMetaAllowStale(cacheKey);
-    let metaSource = "canonical";
 
-    // If canonical miss, try alias
+    // If canonical miss, try alias (cross-cachebuster revalidation)
     if (!meta && aliasKey) {
       meta = this.storage.peekAlias(aliasKey);
-      metaSource = "alias";
     }
 
     if (meta) {
       const fresh = this.storage.isFresh(meta);
 
-      // ─── FRESH HIT: serve from cache ───
+      // ─── FRESH HIT: serve instantly from cache ───
       if (fresh) {
         const body = this.storage.getBlob(meta.blobHash);
         if (body) {
           this.storage.recordHit(url, resourceType, classification.origin, body.length);
-          log.info("CDN-HIT", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
+          log.debug("CDN-HIT", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
           return route.fulfill({
             status: 200,
-            headers: meta.headers || {},
+            headers: this._replayHeaders(meta.headers),
             body
           });
         }
@@ -68,36 +105,37 @@ class RequestHandler {
 
       // ─── STALE with validators: conditional revalidation ───
       if (this.storage.hasValidators(meta)) {
-        const conditionalHeaders = {};
-        if (meta.etag) conditionalHeaders["If-None-Match"] = meta.etag;
-        if (meta.lastModified) conditionalHeaders["If-Modified-Since"] = meta.lastModified;
+        const conditionalHeaders = { ...reqHeaders };
+
+        // Add Via header so origin sees CDN-like traffic pattern
+        conditionalHeaders["via"] = "1.1 CDN_EdgeProxy";
+
+        if (meta.etag) conditionalHeaders["if-none-match"] = meta.etag;
+        if (meta.lastModified) conditionalHeaders["if-modified-since"] = meta.lastModified;
 
         try {
-          const response = await route.fetch({
-            headers: { ...reqHeaders, ...conditionalHeaders }
-          });
+          const response = await route.fetch({ headers: conditionalHeaders });
 
           if (response.status() === 304) {
-            // 304 Not Modified — origin saw the request (publisher gets credit),
-            // but body is 0 bytes (massive bandwidth saving).
+            // 304 — origin confirmed content unchanged
+            // Publisher SEES the request (revenue preserved) but body = 0 bytes
             const body = this.storage.getBlob(meta.blobHash);
             if (body) {
               this.storage.refreshTTL(cacheKey);
               this.storage.recordRevalidated(url, resourceType, classification.origin, body.length);
-              log.info("HIT-304", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
+              log.debug("HIT-304", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
               return route.fulfill({
                 status: 200,
-                headers: meta.headers || {},
+                headers: this._replayHeaders(meta.headers),
                 body
               });
             }
           }
 
-          // 200 — new content
+          // 200 — content changed, store new version
           const newBody = await response.body();
           const respHeaders = response.headers();
 
-          // For fetch/xhr: only cache asset content-types
           if (isFetchXhr && !this.classifier.shouldCacheByContentType(respHeaders["content-type"])) {
             this.storage.recordMiss(url, resourceType, classification.origin, newBody.length);
             return route.fulfill({ status: response.status(), headers: respHeaders, body: newBody });
@@ -108,12 +146,12 @@ class RequestHandler {
           log.info("MISS-UPDATE", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
           return route.fulfill({ status: response.status(), headers: respHeaders, body: newBody });
         } catch (err) {
-          // Revalidation failed — serve stale if possible
+          // Revalidation network error — serve stale as fallback
           const body = this.storage.getBlob(meta.blobHash);
           if (body) {
             this.storage.recordHit(url, resourceType, classification.origin, body.length);
             log.info("STALE-HIT", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
-            return route.fulfill({ status: 200, headers: meta.headers || {}, body });
+            return route.fulfill({ status: 200, headers: this._replayHeaders(meta.headers), body });
           }
         }
       }
@@ -121,7 +159,9 @@ class RequestHandler {
 
     // ─── MISS: fetch from origin ───
     try {
-      const response = await route.fetch();
+      // Add Via header to origin request
+      const fetchHeaders = { ...reqHeaders, "via": "1.1 CDN_EdgeProxy" };
+      const response = await route.fetch({ headers: fetchHeaders });
       const body = await response.body();
       const respHeaders = response.headers();
 
@@ -135,7 +175,7 @@ class RequestHandler {
         await this.storage.put(cacheKey, url, body, respHeaders, resourceType, classification.origin, aliasKey, reqHeaders);
         const dedup = this.storage.isDedup(cacheKey);
         if (dedup) {
-          log.info("Storage", `DEDUP ${url.substring(0, 80)} — same blob ${this.storage.getBlobHashShort(cacheKey)}`);
+          log.debug("Storage", `DEDUP ${url.substring(0, 80)}`);
         }
         this.storage.recordMiss(url, resourceType, classification.origin, body.length);
         log.info("CACHED", `${resourceType} ${classification.origin} ${url.substring(0, 80)}`);
@@ -150,11 +190,22 @@ class RequestHandler {
         const body = this.storage.getBlob(meta.blobHash);
         if (body) {
           log.info("STALE-RESCUE", `${resourceType} ${url.substring(0, 80)}`);
-          return route.fulfill({ status: 200, headers: meta.headers || {}, body });
+          return route.fulfill({ status: 200, headers: this._replayHeaders(meta.headers), body });
         }
       }
       throw err;
     }
+  }
+
+  /**
+   * Replay headers with CDN observability.
+   * Adds X-EdgeProxy header so DevTools shows cache status.
+   */
+  _replayHeaders(stored) {
+    const headers = { ...(stored || {}) };
+    headers["x-edgeproxy"] = "HIT";
+    headers["x-edgeproxy-engine"] = "CDN_EdgeProxy/4.0";
+    return headers;
   }
 }
 

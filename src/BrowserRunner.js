@@ -89,19 +89,14 @@ class BrowserRunner {
       ignoreHTTPSErrors: true
     });
 
-    // Collect all matchDomains for the classifier
-    const allMatchDomains = [];
-    for (const t of this.config.targets) {
-      if (t.matchDomains) allMatchDomains.push(...t.matchDomains);
-    }
-
-    const classifier = new TrafficClassifier(this.config.routing, allMatchDomains);
+    // v4: Universal classifier — no selfDomains needed
+    const classifier = new TrafficClassifier(this.config.routing);
     const handler = new RequestHandler(this.storage, classifier, this.config.cache);
 
     log.info("Phase 3: Starting cache report...");
     this._startReport();
 
-    // Install context-level route interception
+    // Install context-level route interception for ALL requests
     await this.context.route("**/*", async (route) => {
       try {
         await handler.handle(route);
@@ -111,26 +106,10 @@ class BrowserRunner {
       }
     });
 
-    // Open tabs for each target
-    for (let i = 0; i < this.config.targets.length; i++) {
-      const target = this.config.targets[i];
-      log.info(`Phase ${4 + i}: Setting up target ${target.label} → ${target.entryUrl}`);
-
-      let page;
-      const pages = this.context.pages();
-      if (i === 0 && pages.length > 0) {
-        page = pages[0];
-      } else {
-        page = await this.context.newPage();
-      }
-
-      log.info(`Phase ${5 + i}: Navigating to ${target.entryUrl}...`);
-      try {
-        await page.goto(target.entryUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      } catch (err) {
-        log.warn("Navigation", `Timeout for ${target.label}: ${err.message}`);
-      }
-    }
+    // v4: Do NOT open any website — let user browse freely
+    log.info("Phase 4: Browser ready — browse any website, CDN cache is active.");
+    log.info("         All static assets (CSS, JS, images, fonts, media) will be cached.");
+    log.info("         Ad auction/beacon traffic flows through untouched (publisher revenue preserved).");
   }
 
   _startReport() {
