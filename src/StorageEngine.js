@@ -101,7 +101,6 @@ class StorageEngine {
 
   /**
    * peekMeta — NON-DESTRUCTIVE read. Never deletes stale entries.
-   * Returns meta even if body TTL is expired (stale validators needed for 304).
    */
   peekMeta(cacheKey) {
     return this.index.get(cacheKey) || null;
@@ -109,21 +108,18 @@ class StorageEngine {
 
   /**
    * peekMetaAllowStale — returns meta if within staleTTL.
-   * This is the key innovation: validators survive far beyond body freshness
-   * so we can still send If-None-Match / If-Modified-Since and get 304s.
+   * Validators survive far beyond body freshness for conditional revalidation.
    */
   peekMetaAllowStale(cacheKey) {
     const meta = this.index.get(cacheKey);
     if (!meta) return null;
     const age = Date.now() - meta.storedAt;
     if (age < this.staleTTL) return meta;
-    // Truly expired beyond stale TTL — clean up
     return null;
   }
 
   /**
    * Look up alias index to find a related cache entry for revalidation.
-   * Returns meta from the alias's canonical key (if it has validators).
    */
   peekAlias(aliasKey) {
     if (!aliasKey) return null;
@@ -191,7 +187,6 @@ class StorageEngine {
       this.dedupSet.add(cacheKey);
     }
 
-    // Determine vary-aware key suffix
     const vary = headers["vary"] || null;
 
     this.index.set(cacheKey, {
@@ -218,9 +213,9 @@ class StorageEngine {
   }
 
   /**
-   * Pick safe headers for replay.
+   * Safe header replay.
    * CRITICAL: Drop content-encoding & content-length.
-   * Replaying these causes content corruption (Playwright decompresses bodies).
+   * Playwright decompresses bodies, replaying these causes corruption.
    */
   _pickCacheHeaders(headers) {
     const keep = [
@@ -283,7 +278,7 @@ class StorageEngine {
     log.info("Storage", `Eviction complete. ${this.index.size} entries remaining.`);
   }
 
-  // --- Stats ---
+  // ─── Stats ───
   recordHit(url, resourceType, origin, bytes) {
     this.stats.hits++;
     this.stats.bytesServed += bytes;

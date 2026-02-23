@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 "use strict";
 
-const path = require("path");
 const readline = require("readline");
 const { loadConfig } = require("./src/configLoader");
 const { BrowserRunner } = require("./src/BrowserRunner");
 const { log } = require("./src/logger");
 
-const VERSION = "3.1.3";
+const VERSION = "4.0.0";
 
 const BROWSERS = [
   { key: "1", value: "chromium", label: "Chromium (default)" },
@@ -50,9 +49,9 @@ async function main() {
   }
 
   const config = loadConfig();
-  log.info(`EdgeProxy v${VERSION} — Local CDN Engine`);
+  log.info(`EdgeProxy v${VERSION} — Aggressive Local CDN Engine`);
   log.info(`Browser: ${browser}`);
-  log.info(`Targets: ${config.targets.map(t => t.label).join(", ")}`);
+  log.info(`Mode: Universal — all websites cached, no target restriction`);
 
   const runner = new BrowserRunner(browser, config);
   await runner.start();
