@@ -1,126 +1,143 @@
-# CDN EdgeProxy v3.1.1
+# CDN EdgeProxy v3.1.3
 
-**Local CDN cache untuk Playwright — lintas browser (Chromium/Chrome/Edge/Firefox)**
+Local CDN cache engine powered by Playwright. Intercepts and caches static assets
+(images, scripts, stylesheets, fonts) from target websites to save bandwidth.
 
-## Fitur Utama
-
-- 🌐 **Cross-browser**: Chromium, Chrome, Edge, Firefox — pilih dari menu interaktif atau CLI
-- 💾 **Shared cache**: Satu folder `cdn-cache` untuk semua browser (content-addressable by SHA-256)
-- 🔒 **Profile terpisah**: Setiap browser punya `userDataDir` sendiri (cookies/login aman)
-- 🎯 **3-Kelas traffic ads**: Auction (A), Beacon (B), Creative (C) — hanya C yang di-cache
-- ♻️ **Revalidation 304**: Creative yang stale dikirim dengan `If-None-Match` / `If-Modified-Since`
-- 🧹 **LRU eviction**: Otomatis hapus entry terlama saat capacity penuh
-- 🔄 **Atomic writes**: `temp → rename` untuk index & blobs, aman dari race condition
-- 📝 **Debug system**: 4 level log (silent/terminal/terminal+file/file only)
-
-## Instalasi
+## Quick Start
 
 ```bash
+# 1. Install playwright (only dependency!)
 npm install
-```
 
-## Cara Pakai
+# 2. Install browser binaries (first time only)
+npx playwright install
 
-### Menu Interaktif
-```bash
-npm start
-# atau
+# 3. Run
 node index.js
 ```
 
-### CLI Argument
+## What's New in v3.1.3
+
+### Disposable Browser Profile
+- Each run creates a unique temporary profile (`data/tmp-profiles/<browser>/<ts>-<rand>/`)
+- Profile is automatically deleted on shutdown
+- CDN cache (`data/cdn-cache/`) persists across all runs and browsers
+- No .env change required
+
+### Stale Validator Retention (7–30 day staleTTL)
+- Body freshness still follows `CACHE_MAX_AGE` (24h by default)
+- But ETag/Last-Modified validators survive **much longer** (derived internally)
+- Result: most requests after day 1 become **304 revalidations** (0 body bytes from origin)
+- Publisher still sees the request → revenue preserved, bandwidth saved
+
+### Alias-Key Revalidation for Ads/CDN
+- Known ad CDN domains (DoubleClick, googlesyndication, etc.) get an aggressive alias key
+- Strips all query params (cachebuster, nonce, timestamp) to path-only
+- If canonical key misses but alias has validators → conditional revalidation
+- Turns ad creative "dedup misses" into 304 cache hits
+
+### Vary-Aware Cross-Browser Cache
+- When response has `Vary: Accept`, cache key includes Accept header fingerprint
+- Prevents AVIF-to-Firefox or WebP-to-old-browser format mismatch
+- Safe to share `CACHE_DIR` across Chromium/Chrome/Edge/Firefox
+
+### Content-Type Based Caching for fetch/xhr
+- `fetch` and `xhr` requests are only cached if response is asset-like
+- `image/*`, `video/*`, `font/*`, CSS, JS → cached
+- JSON, HTML, text auction responses → bypass cache
+- Prevents auction/bidding data from being cached
+
+### Safe Header Replay
+- Cached headers no longer include `content-encoding` or `content-length`
+- Prevents content corruption when Playwright auto-decompresses gzip/br
+
+## Features
+
+- **Cross-browser**: Chromium, Chrome, Edge, Firefox
+- **Shared cache**: All browsers use the same content-addressable cache
+- **Disposable profiles**: Fresh profile each run, shared CDN cache persists
+- **3-class ads routing**: Auction → bypass, Beacon → bypass, Creative → cache+revalidate
+- **Stale revalidation**: ETag/Last-Modified validators survive 7-30 days
+- **Alias dedup**: Cross-cachebuster revalidation for ad CDNs
+- **Vary-aware**: Accept-fingerprinted keys prevent format mismatch
+- **Content-addressable**: SHA-256 blob dedup
+- **LRU eviction**: Automatic cleanup when cache exceeds maxSize
+- **Atomic writes**: Temp file → rename for index and blobs
+- **Zero-config**: Works out of the box with `.env` defaults
+
+## Configuration
+
+### .env (unchanged from v3.1.2)
+```
+TARGETS=*.detik.com,*.kompas.com
+BROWSER=chromium
+CACHE_MAX_SIZE=2199023255552
+CACHE_MAX_AGE=86400000
+CACHE_DIR=data/cdn-cache
+DEBUG_LEVEL=3
+```
+
+### CLI
 ```bash
 node index.js --browser=chrome
-node index.js --browser=firefox
 node index.js --browser=msedge
-node index.js --browser=chromium
+node index.js --browser=firefox
 ```
 
-### NPM Scripts
+### npm scripts
 ```bash
 npm run chrome
+npm run edge
 npm run firefox
-npm run msedge
-npm run chromium
 ```
 
-## Struktur Direktori
+## Folder Structure
 
 ```
-cdn-edgeproxy-v3.1.1/
-├── index.js                          # Entry point + browser menu
-├── package.json
-├── .env                              # Environment config
+├── .env                    # Environment config (UNCHANGED)
+├── index.js                # Entry point
+├── package.json            # Dependencies (playwright only)
 ├── config/
-│   └── default.json                  # Default settings
+│   └── default.json        # Target & routing rules
 ├── src/
-│   ├── BrowserRunner.js              # Launches browser + registers route
-│   ├── cache/
-│   │   ├── RequestHandler.js         # Core routing pipeline (HIT/304/MISS)
-│   │   ├── TrafficClassifier.js      # Kelas A/B/C classification
-│   │   └── StorageEngine.js          # Content-addressable blob store
-│   └── utils/
-│       ├── configLoader.js           # Merge .env + default.json
-│       └── logger.js                 # Debug logging system
-├── data/
-│   ├── cdn-cache/                    # Shared cache (blobs + index)
-│   │   ├── blobs/                    # SHA-256 sharded blob files
-│   │   └── index.json                # URL → meta mapping
-│   └── profiles/                     # Per-browser persistent profiles
-│       ├── chromium/
-│       ├── chrome/
-│       ├── msedge/
-│       └── firefox/
-└── logs/
-    └── edgeproxy.log
+│   ├── configLoader.js     # Built-in .env parser (no dotenv)
+│   ├── BrowserRunner.js    # Disposable profile launcher
+│   ├── RequestHandler.js   # HIT/304/MISS + stale revalidation
+│   ├── TrafficClassifier.js # 3-class routing + content-type check
+│   ├── StorageEngine.js    # Blob store + alias index + staleTTL
+│   ├── URLNormalizer.js    # Canonical + alias key normalization
+│   ├── ConfigParser.js     # Target/cache parser
+│   ├── CacheReport.js      # Report formatter
+│   └── logger.js           # Logging with levels
+└── data/
+    ├── cdn-cache/          # Shared cache (persists across runs)
+    │   ├── index.json
+    │   ├── alias-index.json
+    │   └── blobs/
+    └── tmp-profiles/       # Disposable (deleted per run)
+        ├── chromium/
+        ├── chrome/
+        ├── msedge/
+        └── firefox/
 ```
 
-## Konsep Pipeline
+## Changelog
 
-```
-Request masuk
-    │
-    ├── Non-GET / document / websocket / Range → BYPASS (continue)
-    │
-    ├── Kelas A (auction/decisioning) → BYPASS
-    ├── Kelas B (beacon/measurement)  → BYPASS
-    │
-    └── Kelas C (creative bytes)
-         │
-         ├── Cache FRESH? → HIT (fulfill dari cache)
-         │
-         ├── Cache STALE + ada etag/last-modified?
-         │    ├── 304 → HIT-304 (refresh TTL, serve cached)
-         │    └── 200 → MISS-UPDATE (update cache)
-         │
-         └── MISS → fetch + cache + fulfill
-```
+### v3.1.3
+- **NEW**: Disposable browser profile (auto-created & deleted per run)
+- **NEW**: Stale validator retention (staleTTL = 7-30 days internally derived)
+- **NEW**: Alias-key revalidation for ad/CDN cross-cachebuster dedup
+- **NEW**: Vary-aware cache key (Accept fingerprint) for cross-browser safety
+- **NEW**: Content-type based caching for fetch/xhr (only assets, not auction JSON)
+- **FIXED**: Dropped content-encoding & content-length from cached headers
+- **FIXED**: Enhanced beacon detection (URL keywords + resource type)
+- **.env**: UNCHANGED — fully backward compatible with v3.1.2
 
-## Win-Win Ads Concept
+### v3.1.2
+- Removed `dotenv` dependency — `.env` parsed with built-in Node.js code
+- Only external dependency is `playwright`
 
-- **Publisher tetap dapat revenue**: Auction & beacon TIDAK di-cache
-- **Hemat kuota**: Creative yang 100% sama dilayani dari cache
-- **Revalidation**: Bahkan creative yang "anti-cache" bisa hemat via 304
-- **Content-hash dedup**: URL berbeda tapi body sama → 1 blob file
-
-## Konfigurasi
-
-### .env
-| Variable | Default | Keterangan |
-|----------|---------|------------|
-| BROWSER | chromium | Engine browser |
-| TARGET_URL | https://example.com | URL awal |
-| HEADLESS | false | Headless mode |
-| SERVICE_WORKERS | block | block/allow |
-| CACHE_MAX_SIZE_GB | 2 | Kapasitas max cache |
-| CACHE_MAX_AGE_HOURS | 24 | TTL max entry cache |
-| DEBUG_MODE | false | Aktifkan debug log |
-| DEBUG_LOG | 3 | 0=silent, 1=term, 2=term+file, 3=file |
-
-## Catatan Penting
-
-⚠️ **Jangan jalankan 2 browser dengan `userDataDir` yang sama** — Playwright melarang ini.
-
-⚠️ **Service Worker**: Direkomendasikan `block` agar semua request terintercept. Jika butuh SW, set `allow` tapi siap sebagian request bypass cache.
-
-⚠️ **Header replay**: `content-encoding` dan `content-length` TIDAK di-replay dari cache untuk menghindari body rusak.
+### v3.1.1
+- Wildcard target format (`*.detik.com,*.kompas.com`)
+- Auto-config for unknown domains
+- Pre-defined matchDomains for known sites

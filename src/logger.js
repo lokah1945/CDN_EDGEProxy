@@ -17,7 +17,6 @@ const log = {
   debug(...args) { if (getLevel() >= 4) console.log(`${ts()} DEBUG`, ...args); }
 };
 
-// Global unhandled rejection handler
 process.on("unhandledRejection", (reason) => {
   log.warn("UnhandledRejection", reason?.message || reason);
 });

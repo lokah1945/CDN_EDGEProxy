@@ -1,18 +1,17 @@
 {
   "name": "cdn-edgeproxy",
-  "version": "3.1.1",
-  "description": "CDN EdgeProxy — Local CDN cache for Playwright (Chromium/Chrome/Edge/Firefox)",
+  "version": "3.1.3",
+  "description": "CDN EdgeProxy - Local CDN Cache Engine with Playwright",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "chromium": "node index.js --browser=chromium",
     "chrome": "node index.js --browser=chrome",
-    "msedge": "node index.js --browser=msedge",
+    "edge": "node index.js --browser=msedge",
     "firefox": "node index.js --browser=firefox"
   },
   "dependencies": {
     "playwright": "^1.50.0"
   },
-  "author": "CDN EdgeProxy",
   "license": "MIT"
 }

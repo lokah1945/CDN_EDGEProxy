@@ -11,11 +11,18 @@ class StorageEngine {
     this.maxSize = cacheConfig.maxSize || 2199023255552;
     this.maxAge = cacheConfig.maxAge || 86400000;
 
+    // Stale TTL — validators survive much longer than body freshness.
+    // Derived internally: max(maxAge * 30, 7 days). No .env change needed.
+    this.staleTTL = Math.max(this.maxAge * 30, 7 * 24 * 60 * 60 * 1000);
+
     this.indexPath = path.join(this.dir, "index.json");
+    this.aliasIndexPath = path.join(this.dir, "alias-index.json");
     this.blobDir = path.join(this.dir, "blobs");
 
-    // In-memory index: cacheKey → { url, blobHash, storedAt, headers, etag, lastModified, resourceType, origin, size }
+    // In-memory index: cacheKey → meta
     this.index = new Map();
+    // Alias index: aliasKey → cacheKey (for cross-cachebuster revalidation)
+    this.aliasIndex = new Map();
     // In-memory blob cache: blobHash → Buffer
     this.blobs = new Map();
     // Dedup tracker
@@ -23,7 +30,7 @@ class StorageEngine {
 
     // Stats
     this.stats = {
-      hits: 0, misses: 0,
+      hits: 0, misses: 0, revalidated: 0,
       bytesFetched: 0, bytesServed: 0,
       byOrigin: {},
       byType: {},
@@ -34,7 +41,7 @@ class StorageEngine {
   async init() {
     fs.mkdirSync(this.blobDir, { recursive: true });
 
-    // Load index
+    // Load main index
     if (fs.existsSync(this.indexPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.indexPath, "utf-8"));
@@ -43,6 +50,18 @@ class StorageEngine {
         }
       } catch (err) {
         log.warn("Storage", "Index corrupted, starting fresh");
+      }
+    }
+
+    // Load alias index
+    if (fs.existsSync(this.aliasIndexPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(this.aliasIndexPath, "utf-8"));
+        for (const [key, val] of Object.entries(raw)) {
+          this.aliasIndex.set(key, val);
+        }
+      } catch (err) {
+        log.warn("Storage", "Alias index corrupted, starting fresh");
       }
     }
 
@@ -57,8 +76,8 @@ class StorageEngine {
       }
     }
 
-    const ramMB = this._totalRAMSize() / 1024 / 1024;
-    log.info("Storage", `Initialized: ${this.index.size} entries, ${(diskSize / 1024 / 1024).toFixed(1)}MB on disk`);
+    log.info("Storage", `Initialized: ${this.index.size} entries, ${this.aliasIndex.size} aliases, ${(diskSize / 1024 / 1024).toFixed(1)}MB on disk`);
+    log.info("Storage", `Body TTL: ${(this.maxAge / 3600000).toFixed(1)}h | Stale validator TTL: ${(this.staleTTL / 86400000).toFixed(0)}d`);
   }
 
   urlToKey(url) {
@@ -70,7 +89,6 @@ class StorageEngine {
   }
 
   _blobPath(hash) {
-    // Shard: first 2 chars as subdirectory
     const shard = hash.substring(0, 2);
     return path.join(this.blobDir, shard, hash);
   }
@@ -82,16 +100,55 @@ class StorageEngine {
   }
 
   /**
-   * peekMeta — NON-DESTRUCTIVE read (crucial for revalidation pipeline).
-   * Does NOT delete stale entries; only returns metadata.
+   * peekMeta — NON-DESTRUCTIVE read. Never deletes stale entries.
+   * Returns meta even if body TTL is expired (stale validators needed for 304).
    */
   peekMeta(cacheKey) {
     return this.index.get(cacheKey) || null;
   }
 
+  /**
+   * peekMetaAllowStale — returns meta if within staleTTL.
+   * This is the key innovation: validators survive far beyond body freshness
+   * so we can still send If-None-Match / If-Modified-Since and get 304s.
+   */
+  peekMetaAllowStale(cacheKey) {
+    const meta = this.index.get(cacheKey);
+    if (!meta) return null;
+    const age = Date.now() - meta.storedAt;
+    if (age < this.staleTTL) return meta;
+    // Truly expired beyond stale TTL — clean up
+    return null;
+  }
+
+  /**
+   * Look up alias index to find a related cache entry for revalidation.
+   * Returns meta from the alias's canonical key (if it has validators).
+   */
+  peekAlias(aliasKey) {
+    if (!aliasKey) return null;
+    const canonKey = this.aliasIndex.get(aliasKey);
+    if (!canonKey) return null;
+    return this.peekMetaAllowStale(canonKey);
+  }
+
+  /**
+   * Check if body is fresh (within CACHE_MAX_AGE).
+   */
+  isFresh(meta) {
+    if (!meta) return false;
+    return (Date.now() - meta.storedAt) < this.maxAge;
+  }
+
+  /**
+   * Check if meta has validators for conditional revalidation.
+   */
+  hasValidators(meta) {
+    return meta && (meta.etag || meta.lastModified);
+  }
+
   getBlob(blobHash) {
     if (this.blobs.has(blobHash)) return this.blobs.get(blobHash);
-    // Fallback to disk
     const p = this._blobPath(blobHash);
     if (fs.existsSync(p)) {
       const buf = fs.readFileSync(p);
@@ -118,12 +175,11 @@ class StorageEngine {
     return meta ? meta.blobHash.substring(0, 12) : "unknown";
   }
 
-  async put(cacheKey, url, body, headers, resourceType, origin) {
+  async put(cacheKey, url, body, headers, resourceType, origin, aliasKey, requestHeaders) {
     const hash = this._blobHash(body);
     const isNewBlob = !this.blobs.has(hash);
 
     if (isNewBlob) {
-      // Atomic write: temp file → rename
       const blobPath = this._blobPath(hash);
       const dir = path.dirname(blobPath);
       fs.mkdirSync(dir, { recursive: true });
@@ -135,7 +191,9 @@ class StorageEngine {
       this.dedupSet.add(cacheKey);
     }
 
-    // Update index
+    // Determine vary-aware key suffix
+    const vary = headers["vary"] || null;
+
     this.index.set(cacheKey, {
       url,
       blobHash: hash,
@@ -143,21 +201,47 @@ class StorageEngine {
       headers: this._pickCacheHeaders(headers),
       etag: headers["etag"] || null,
       lastModified: headers["last-modified"] || null,
+      vary: vary || null,
       resourceType,
       origin,
       size: body.length
     });
 
+    // Register alias for cross-cachebuster revalidation
+    if (aliasKey) {
+      this.aliasIndex.set(aliasKey, cacheKey);
+      this._saveAliasIndex();
+    }
+
     this._saveIndex();
     this._evictIfNeeded();
   }
 
+  /**
+   * Pick safe headers for replay.
+   * CRITICAL: Drop content-encoding & content-length.
+   * Replaying these causes content corruption (Playwright decompresses bodies).
+   */
   _pickCacheHeaders(headers) {
-    const keep = ["content-type", "content-encoding", "cache-control", "etag", "last-modified", "vary"];
+    const keep = [
+      "content-type",
+      "cache-control",
+      "etag",
+      "last-modified",
+      "vary",
+      "access-control-allow-origin",
+      "access-control-allow-credentials",
+      "access-control-allow-methods",
+      "access-control-allow-headers",
+      "access-control-expose-headers",
+      "timing-allow-origin",
+      "x-content-type-options",
+    ];
     const result = {};
     for (const k of keep) {
       if (headers[k]) result[k] = headers[k];
     }
+    // NEVER include content-encoding or content-length
     return result;
   }
 
@@ -169,18 +253,25 @@ class StorageEngine {
     fs.renameSync(tmpPath, this.indexPath);
   }
 
+  _saveAliasIndex() {
+    const obj = {};
+    for (const [k, v] of this.aliasIndex) obj[k] = v;
+    const tmpPath = this.aliasIndexPath + ".tmp." + process.pid;
+    fs.writeFileSync(tmpPath, JSON.stringify(obj));
+    fs.renameSync(tmpPath, this.aliasIndexPath);
+  }
+
   _evictIfNeeded() {
     let totalSize = 0;
     for (const [, meta] of this.index) totalSize += (meta.size || 0);
     if (totalSize <= this.maxSize) return;
 
-    // LRU eviction: sort by storedAt ascending
     const entries = [...this.index.entries()].sort((a, b) => a[1].storedAt - b[1].storedAt);
     while (totalSize > this.maxSize * 0.9 && entries.length > 0) {
       const [key, meta] = entries.shift();
       totalSize -= (meta.size || 0);
       this.index.delete(key);
-      // Don't delete blob if other entries reference it
+      // Refcount-aware blob deletion
       const stillUsed = [...this.index.values()].some(m => m.blobHash === meta.blobHash);
       if (!stillUsed) {
         this.blobs.delete(meta.blobHash);
@@ -192,8 +283,17 @@ class StorageEngine {
     log.info("Storage", `Eviction complete. ${this.index.size} entries remaining.`);
   }
 
-  // Stats tracking
+  // --- Stats ---
   recordHit(url, resourceType, origin, bytes) {
+    this.stats.hits++;
+    this.stats.bytesServed += bytes;
+    this._trackOrigin(origin, "hit", bytes);
+    this._trackType(resourceType, "hit");
+    this._trackTopAsset(url, bytes);
+  }
+
+  recordRevalidated(url, resourceType, origin, bytes) {
+    this.stats.revalidated++;
     this.stats.hits++;
     this.stats.bytesServed += bytes;
     this._trackOrigin(origin, "hit", bytes);
@@ -241,9 +341,9 @@ class StorageEngine {
     for (const [, meta] of this.index) diskSize += (meta.size || 0);
     const diskMB = (diskSize / 1024 / 1024).toFixed(1);
 
-    let report = `Cache entries: ${this.index.size} | Unique blobs: ${uniqueBlobs} | Dedup hits: ${dedups}\n`;
+    let report = `Cache entries: ${this.index.size} | Aliases: ${this.aliasIndex.size} | Unique blobs: ${uniqueBlobs} | Dedup hits: ${dedups}\n`;
     report += `RAM blobs: ${this.blobs.size} (${ramMB}MB) | Disk: ${diskMB}MB\n`;
-    report += `HIT: ${this.stats.hits} | MISS: ${this.stats.misses} | Ratio: ${ratio}%\n`;
+    report += `HIT: ${this.stats.hits} | MISS: ${this.stats.misses} | 304-revalidated: ${this.stats.revalidated} | Ratio: ${ratio}%\n`;
     report += `Bytes fetched (quota used): ${(this.stats.bytesFetched / 1024 / 1024).toFixed(1)} MB\n`;
     report += `Bytes served from cache: ${(this.stats.bytesServed / 1024 / 1024).toFixed(1)} MB\n`;
     report += `QUOTA SAVED: ${(this.stats.bytesServed / 1024 / 1024).toFixed(1)} MB\n`;
@@ -258,7 +358,6 @@ class StorageEngine {
       report += `  ${type}: HIT ${s.hit} | MISS ${s.miss}\n`;
     }
 
-    // Top 10
     const topAssets = [...this.stats.topAssets.entries()]
       .sort((a, b) => b[1].bytes - a[1].bytes)
       .slice(0, 10);

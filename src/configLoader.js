@@ -3,11 +3,6 @@
 const fs = require("fs");
 const path = require("path");
 
-/**
- * Built-in .env parser — replaces dotenv dependency entirely.
- * Reads .env from project root, parses KEY=VALUE pairs,
- * and merges into process.env (without overwriting existing vars).
- */
 function loadEnvFile() {
   const envPath = path.resolve(process.cwd(), ".env");
   if (!fs.existsSync(envPath)) return;
@@ -19,7 +14,6 @@ function loadEnvFile() {
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
     let val = trimmed.slice(eqIdx + 1).trim();
-    // Strip surrounding quotes
     if ((val.startsWith('"') && val.endsWith('"')) ||
         (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
@@ -35,17 +29,12 @@ function parseWildcardTargets(raw) {
 }
 
 function patternToConfig(pattern, knownTargets) {
-  // e.g. "*.detik.com" → domain "detik.com", label "detik"
   const domain = pattern.replace(/^\*\./, "");
   const label = domain.split(".")[0];
-
-  // Check if we have a pre-defined config in default.json
   const known = knownTargets.find(t =>
     t.pattern === pattern || t.label === label
   );
   if (known) return known;
-
-  // Auto-generate config for unknown domains
   return {
     pattern,
     label,
@@ -55,17 +44,14 @@ function patternToConfig(pattern, knownTargets) {
 }
 
 function loadConfig() {
-  // Parse .env first (built-in, no dotenv needed)
   loadEnvFile();
 
-  // Load default.json
   const defaultPath = path.resolve(process.cwd(), "config", "default.json");
   let defaults = { targets: [], routing: {}, cache: {}, browser: {} };
   if (fs.existsSync(defaultPath)) {
     defaults = JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
   }
 
-  // Parse TARGETS from env
   const rawTargets = process.env.TARGETS || "";
   const patterns = rawTargets ? parseWildcardTargets(rawTargets) : [];
 
