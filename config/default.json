@@ -1,0 +1,77 @@
+{
+  "targets": [
+    {
+      "pattern": "*.detik.com",
+      "label": "detik",
+      "entryUrl": "https://www.detik.com",
+      "matchDomains": [
+        "detik.com",
+        "detik.net.id",
+        "detikcdn.com"
+      ]
+    },
+    {
+      "pattern": "*.kompas.com",
+      "label": "kompas",
+      "entryUrl": "https://www.kompas.com",
+      "matchDomains": [
+        "kompas.com",
+        "kompascdn.com",
+        "kompasiana.com",
+        "grid.id"
+      ]
+    }
+  ],
+  "routing": {
+    "classA": {
+      "name": "auction/decisioning",
+      "action": "bypass",
+      "patterns": [
+        "*/ad?*",
+        "*/ads?*",
+        "*/adx?*",
+        "*/bid*",
+        "*/auction*",
+        "*/rtb*",
+        "*/prebid*",
+        "*/header-bidding*",
+        "*securepubads*gpt.js*",
+        "*pagead2*googlesyndication*",
+        "*openx.net/w/*"
+      ]
+    },
+    "classB": {
+      "name": "measurement/beacon",
+      "action": "bypass",
+      "patterns": [
+        "*/pixel*",
+        "*/beacon*",
+        "*/track*",
+        "*/analytics*",
+        "*/collect*",
+        "*/log?*",
+        "*/event?*",
+        "*/impression*",
+        "*facebook.com/tr*",
+        "*google-analytics.com/collect*",
+        "*doubleclick.net/pcs/view*",
+        "*doubleclick.net/pagead/adview*"
+      ]
+    },
+    "classC": {
+      "name": "creative/static",
+      "action": "cache",
+      "description": "Ad creatives, images, scripts, fonts \u2014 cacheable bytes"
+    }
+  },
+  "cache": {
+    "maxSize": 2199023255552,
+    "maxAge": 86400000,
+    "staleWhileRevalidate": 3600000,
+    "dir": "data/cdn-cache"
+  },
+  "browser": {
+    "serviceWorkers": "block",
+    "profileBase": "data/profiles"
+  }
+}
