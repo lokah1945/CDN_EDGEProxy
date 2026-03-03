@@ -2,11 +2,6 @@
 
 const crypto = require("crypto");
 
-/**
- * URL normalization for canonical + alias cache keys.
- * v3.1.3: Added aliasKey for aggressive ad/CDN dedup,
- *         and Vary-aware accept fingerprint for cross-browser safety.
- */
 class URLNormalizer {
   constructor() {
     this.trackingParams = new Set([
@@ -29,6 +24,15 @@ class URLNormalizer {
       "bust", "buster", "nc",
     ]);
 
+    // v4.1: Added "chunk", "m" (common in webpack/vite builds)
+    this.staticVersionParams = new Set([
+      "v", "ver", "version", "hash", "h", "rev", "build",
+      "cb", "cachebuster", "cache_buster",
+      "t", "ts", "timestamp", "_", "__",
+      "rnd", "rand", "random", "nc",
+      "chunk", "m",
+    ]);
+
     this.pathOnlyDomains = [
       "tpc.googlesyndication.com",
       "pagead2.googlesyndication.com",
@@ -36,8 +40,7 @@ class URLNormalizer {
       "fonts.googleapis.com",
     ];
 
-    // Domains where alias-key strips even more aggressively
-    this.aliasDomains = [
+    this.adAliasDomains = [
       "tpc.googlesyndication.com",
       "pagead2.googlesyndication.com",
       "googleads.g.doubleclick.net",
@@ -46,12 +49,11 @@ class URLNormalizer {
       "static.xx.fbcdn.net",
       "creative.ak.fbcdn.net",
     ];
+
+    this.staticExtensions = /\.(js|css|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico|wasm|mp4|webm|mp3|ogg)(\?|$)/i;
   }
 
-  /**
-   * Canonical key — standard normalization (strip tracking, sort query).
-   */
-  canonicalKey(url, classification) {
+  canonicalKey(url, origin) {
     try {
       const u = new URL(url);
       const hostname = u.hostname.toLowerCase();
@@ -67,8 +69,8 @@ class URLNormalizer {
       for (const [key] of params) {
         const kl = key.toLowerCase();
         if (this.trackingParams.has(kl)) { toDelete.push(key); continue; }
-        if (classification === "ad" && this.adCdnStripParams.has(kl)) { toDelete.push(key); continue; }
-        if (classification === "ad") {
+        if (origin === "ad" && this.adCdnStripParams.has(kl)) { toDelete.push(key); continue; }
+        if (origin === "ad") {
           const val = params.get(key);
           if (val && /^\d{10,}$/.test(val)) { toDelete.push(key); continue; }
         }
@@ -83,28 +85,40 @@ class URLNormalizer {
     }
   }
 
-  /**
-   * Alias key — aggressive normalization for ad/CDN domains.
-   * Strips ALL query params (path-only) on known alias domains,
-   * enabling cross-cachebuster dedup + conditional revalidation.
-   * Returns null if no alias applies.
-   */
   aliasKey(url) {
     try {
       const u = new URL(url);
       const hostname = u.hostname.toLowerCase();
-      const isAlias = this.aliasDomains.some(d => hostname === d || hostname.endsWith("." + d));
-      if (!isAlias) return null;
-      return `alias|${hostname}${u.pathname}`;
+
+      // Strategy 1: Ad CDN → path-only
+      const isAdAlias = this.adAliasDomains.some(d => hostname === d || hostname.endsWith("." + d));
+      if (isAdAlias) {
+        return `alias|${hostname}${u.pathname}`;
+      }
+
+      // Strategy 2: Static assets → strip version params
+      if (this.staticExtensions.test(u.pathname)) {
+        const params = new URLSearchParams(u.searchParams);
+        let stripped = false;
+        for (const [key] of [...params]) {
+          if (this.staticVersionParams.has(key.toLowerCase())) {
+            params.delete(key);
+            stripped = true;
+          }
+        }
+        if (stripped) {
+          params.sort();
+          const qs = params.toString();
+          return qs ? `alias|${hostname}${u.pathname}?${qs}` : `alias|${hostname}${u.pathname}`;
+        }
+      }
+
+      return null;
     } catch {
       return null;
     }
   }
 
-  /**
-   * Vary-aware key suffix for cross-browser safety.
-   * Appends accept fingerprint when response has Vary: Accept.
-   */
   varyKey(canonicalKey, requestHeaders, responseVary) {
     if (!responseVary) return canonicalKey;
     const vary = responseVary.toLowerCase();

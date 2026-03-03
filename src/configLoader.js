@@ -24,46 +24,20 @@ function loadEnvFile() {
   }
 }
 
-function parseWildcardTargets(raw) {
-  return raw.split(",").map(s => s.trim()).filter(Boolean);
-}
-
-function patternToConfig(pattern, knownTargets) {
-  const domain = pattern.replace(/^\*\./, "");
-  const label = domain.split(".")[0];
-  const known = knownTargets.find(t =>
-    t.pattern === pattern || t.label === label
-  );
-  if (known) return known;
-  return {
-    pattern,
-    label,
-    entryUrl: `https://www.${domain}`,
-    matchDomains: [domain]
-  };
-}
-
 function loadConfig() {
   loadEnvFile();
 
   const defaultPath = path.resolve(process.cwd(), "config", "default.json");
-  let defaults = { targets: [], routing: {}, cache: {}, browser: {} };
+  let defaults = { routing: {}, cache: {}, browser: {}, logging: {} };
   if (fs.existsSync(defaultPath)) {
     defaults = JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
   }
 
-  const rawTargets = process.env.TARGETS || "";
-  const patterns = rawTargets ? parseWildcardTargets(rawTargets) : [];
-
-  let targets;
-  if (patterns.length > 0) {
-    targets = patterns.map(p => patternToConfig(p, defaults.targets || []));
-  } else {
-    targets = defaults.targets || [];
-  }
+  // v4.1.1: Parse DEBUG_LEVEL (0-4, default 3)
+  const debugLevel = parseInt(process.env.DEBUG_LEVEL);
+  const level = (!isNaN(debugLevel) && debugLevel >= 0 && debugLevel <= 4) ? debugLevel : 3;
 
   return {
-    targets,
     routing: defaults.routing || {},
     cache: {
       maxSize:  parseInt(process.env.CACHE_MAX_SIZE) || defaults.cache?.maxSize  || 2199023255552,
@@ -75,8 +49,12 @@ function loadConfig() {
       serviceWorkers: defaults.browser?.serviceWorkers || "block",
       profileBase:    defaults.browser?.profileBase    || "data/profiles"
     },
+    logging: {
+      level: level,
+      dir:   process.env.LOG_DIR || defaults.logging?.dir || "logs"
+    },
     BROWSER: process.env.BROWSER || "chromium",
-    DEBUG_LEVEL: parseInt(process.env.DEBUG_LEVEL) || 3
+    DEBUG_LEVEL: level
   };
 }
 
