@@ -47,6 +47,21 @@
     "staleWhileRevalidate": 3600000,
     "dir": "data/cdn-cache"
   },
+  "stealth": {
+    "injectViaHeader": false,
+    "viaHeaderValue": "1.1 EdgeProxy",
+    "exposeDebugHeaders": false,
+    "debugHeaderPrefix": "x-edgeproxy"
+  },
+  "memory": {
+    "maxHotBlobBytes": 268435456,
+    "hotBlobMaxAge": 300000,
+    "preloadBlobs": false
+  },
+  "concurrency": {
+    "indexFlushDebounceMs": 2000,
+    "useFlock": true
+  },
   "browser": {
     "serviceWorkers": "block",
     "profileBase": "data/profiles"
@@ -54,6 +69,6 @@
   "logging": {
     "level": 3,
     "dir": "logs",
-    "description": "0=silent (live report only), 1=error, 2=warn, 3=info, 4=debug+file"
+    "description": "0=silent, 1=error, 2=warn, 3=info, 4=debug+file"
   }
 }
