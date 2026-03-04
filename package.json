@@ -1,6 +1,6 @@
 {
   "name": "cdn-edgeproxy",
-  "version": "4.1.1",
+  "version": "5.0.0",
   "description": "CDN EdgeProxy \u2014 Aggressive Local CDN Cache Engine with Playwright",
   "main": "index.js",
   "scripts": {
