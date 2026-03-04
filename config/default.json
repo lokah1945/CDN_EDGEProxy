@@ -1,4 +1,6 @@
 {
+  "_comment": "CDN EdgeProxy v6.0.0 — Default Configuration",
+
   "routing": {
     "classA": {
       "name": "auction/decisioning",
@@ -41,31 +43,50 @@
       "description": "All cacheable static assets + HTML (conditional)"
     }
   },
+
   "cache": {
     "maxSize": 2199023255552,
     "maxAge": 86400000,
-    "dir": "data/cdn-cache"
+    "dir": "data/cdn-cache",
+    "_maxSizeComment": "2TB default — override per deployment",
+    "_maxAgeComment": "24h in ms",
+
+    "maxEntrySize": 52428800,
+    "_maxEntrySizeComment": "50MB — single entries larger than this are never cached, preventing one large video from evicting everything"
   },
+
   "stealth": {
     "injectViaHeader": false,
     "viaHeaderValue": "1.1 EdgeProxy",
     "exposeDebugHeaders": false,
-    "debugHeaderPrefix": "x-edgeproxy"
+    "debugHeaderPrefix": "x-edgeproxy",
+    "_comment": "injectViaHeader=false means no Via header is added to upstream requests. exposeDebugHeaders=false means no x-edgeproxy headers on responses. Both protect against ad-network fingerprinting."
   },
+
   "memory": {
     "maxHotBlobBytes": 268435456,
-    "preloadBlobs": false
+    "preloadBlobs": false,
+    "_maxHotBlobBytesComment": "256MB LRU in-memory hot cache for recently-served blobs",
+    "_preloadBlobsComment": "Set true to pre-warm hot cache from disk on startup (slower init, faster first hit)"
   },
+
   "concurrency": {
-    "indexFlushDebounceMs": 2000
+    "indexFlushDebounceMs": 2000,
+    "ipcPollMs": 5000,
+    "staleCleanupMs": 1800000,
+    "_indexFlushDebounceMsComment": "Wait 2s after last write before persisting index to disk. BUG 3 fix: was silently ignored in v5.",
+    "_ipcPollMsComment": "Every 5s, check if another process has updated the index (IPC via index-version.json). BUG 5 fix.",
+    "_staleCleanupMsComment": "Every 30min, remove entries older than staleTTL from index. Prevents unbounded growth."
   },
+
   "browser": {
     "serviceWorkers": "block",
     "profileBase": "data/profiles"
   },
+
   "logging": {
     "level": 3,
     "dir": "logs",
-    "description": "0=silent, 1=error, 2=warn, 3=info, 4=debug+file"
+    "description": "0=silent, 1=error, 2=warn, 3=info, 4=debug+file. Zero console output at all levels."
   }
 }
