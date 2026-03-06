@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * CDN EdgeProxy v6.0.0 — Runtime
+ * CDN EdgeProxy v6.2.0 — Runtime
  *
  * Public API (unchanged from v5):
  *   EdgeCacheRuntime.init()
@@ -11,12 +11,18 @@
  *   EdgeCacheRuntime.getReport()
  *   EdgeCacheRuntime.getStats()
  *
- * Changes from v5:
- *  - VERSION bumped to "6.0.0"
- *  - BUG 3 FIX: concurrencyConfig passed as 3rd arg to StorageEngine constructor
- *  - BUG 8 FIX: version string passed to initLogger() so log headers match
- *  - startReportTimer / stopReportTimer preserved
- *  - shutdown() now calls storage.shutdown() for clean interval teardown
+ * NEW in v6.2.0:
+ *   EdgeCacheRuntime.getHealth()     — Quick health check data
+ *   EdgeCacheRuntime.reloadConfig()  — Dynamic config reload (maxAge, logLevel, etc.)
+ *
+ * CHANGELOG v6.2.0 (2026-03-07):
+ *  - StorageEngine: GDSF eviction, blob compression, cache partitioning, immutable support
+ *  - TrafficClassifier: VAST/SIMID/OMID, Privacy Sandbox, CTV patterns, expanded domains
+ *  - URLNormalizer: enhanced detection, path timestamps, expanded domains, Vary: Accept-Language
+ *  - RequestHandler: stale-refresh, size validation, cache deception protection, content-type check
+ *  - Logger: JSON format option, size-based log rotation
+ *  - Runtime: getHealth(), reloadConfig()
+ *  - VERSION bumped to "6.2.0"
  */
 
 const path = require("path");
@@ -26,7 +32,7 @@ const { RequestHandler }   = require("./lib/RequestHandler");
 const { TrafficClassifier } = require("./lib/TrafficClassifier");
 const defaultConfig        = require("./config/default.json");
 
-const VERSION     = "6.0.0";
+const VERSION     = "6.2.0";
 const MODULE_ROOT = __dirname;
 
 class EdgeCacheRuntime {
@@ -39,6 +45,7 @@ class EdgeCacheRuntime {
     this._attachedContexts = new Map();
     this._initialized      = false;
     this._reportInterval   = null;
+    this._initTime         = null;
   }
 
   async init() {
@@ -53,20 +60,25 @@ class EdgeCacheRuntime {
       ? path.resolve(this.config.logDir)
       : path.join(MODULE_ROOT, "logs");
 
-    // BUG 8 FIX: pass VERSION to initLogger so log file header says "v6.0.0"
-    this.logger = initLogger(logLevel, logDir, VERSION);
+    // v6.2.0: Pass logging options (format, rotation)
+    const logOptions = this.config.logging || defaultConfig.logging || {};
+    this.logger = initLogger(logLevel, logDir, VERSION, {
+      format:        logOptions.format        || "text",
+      maxFileSizeMB: logOptions.maxFileSizeMB || 50,
+      maxFiles:      logOptions.maxFiles      || 10,
+    });
     this.logger.info("Runtime", `CDN EdgeProxy v${VERSION} — initializing`);
 
     const cacheConfig = {
       dir:          this.config.cacheDir  || path.join(MODULE_ROOT, "data", "cdn-cache"),
       maxSize:      this.config.maxSize   || defaultConfig.cache.maxSize,
       maxAge:       this.config.maxAge    || defaultConfig.cache.maxAge,
-      // Enterprise: max entry size from config
       maxEntrySize: this.config.maxEntrySize || defaultConfig.cache.maxEntrySize,
+      // v6.2.0: Cache partitioning budgets
+      originBudgets: this.config.originBudgets || defaultConfig.cache.originBudgets || null,
     };
 
     const memoryConfig      = this.config.memory      || defaultConfig.memory      || {};
-    // BUG 3 FIX: concurrencyConfig is now correctly passed as the 3rd argument
     const concurrencyConfig = this.config.concurrency || defaultConfig.concurrency || {};
 
     this.storage = new StorageEngine(cacheConfig, memoryConfig, concurrencyConfig);
@@ -83,8 +95,13 @@ class EdgeCacheRuntime {
     this.logger.info("Runtime", `Stealth: Via=${stealthConfig.injectViaHeader ? "ON" : "OFF"} | DebugHeaders=${stealthConfig.exposeDebugHeaders ? "ON" : "OFF"}`);
     this.logger.info("Runtime", `Concurrency: IndexFlushDebounce=${concurrencyConfig.indexFlushDebounceMs || 2000}ms | IpcPoll=${concurrencyConfig.ipcPollMs || 5000}ms`);
     this.logger.info("Runtime", `Cache: MaxSize=${(cacheConfig.maxSize / 1024 / 1024 / 1024).toFixed(1)}GB | MaxEntrySize=${(cacheConfig.maxEntrySize / 1024 / 1024).toFixed(0)}MB | MaxAge=${(cacheConfig.maxAge / 3600000).toFixed(1)}h`);
+    if (cacheConfig.originBudgets) {
+      this.logger.info("Runtime", `Partitioning: ad=${(cacheConfig.originBudgets.ad * 100).toFixed(0)}% | thirdparty=${(cacheConfig.originBudgets.thirdparty * 100).toFixed(0)}% | document=${(cacheConfig.originBudgets.document * 100).toFixed(0)}%`);
+    }
+    this.logger.info("Runtime", `Logger: format=${logOptions.format || "text"} | maxFileSize=${logOptions.maxFileSizeMB || 50}MB | maxFiles=${logOptions.maxFiles || 10}`);
 
     this._initialized = true;
+    this._initTime    = Date.now();
     this.logger.info("Runtime", `CDN EdgeProxy v${VERSION} — Ready`);
   }
 
@@ -139,13 +156,96 @@ class EdgeCacheRuntime {
     return this.storage.getStats();
   }
 
+  /**
+   * v6.2.0: Quick health check data
+   * Returns lightweight health status for monitoring/alerting
+   */
+  getHealth() {
+    if (!this._initialized || !this.storage) {
+      return { status: "not_initialized", version: VERSION };
+    }
+
+    const stats = this.storage.getStats();
+    const memUsage = process.memoryUsage();
+    const uptimeMs = Date.now() - this._initTime;
+
+    return {
+      status: "healthy",
+      version: VERSION,
+      uptime: {
+        ms: uptimeMs,
+        human: this._formatUptime(uptimeMs),
+      },
+      cache: {
+        entries:       stats.entries,
+        hitRatio:      stats.cacheEfficiency + "%",
+        diskBytes:     stats.diskBytes,
+        hotBlobBytes:  stats.hotBlobBytes,
+        bandwidthSaved: stats.bandwidthSavedPct + "%",
+      },
+      memory: {
+        heapUsedMB:  (memUsage.heapUsed / 1024 / 1024).toFixed(1),
+        heapTotalMB: (memUsage.heapTotal / 1024 / 1024).toFixed(1),
+        rssMB:       (memUsage.rss / 1024 / 1024).toFixed(1),
+      },
+      contexts: this._attachedContexts.size,
+    };
+  }
+
+  _formatUptime(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (d > 0) return `${d}d ${h % 24}h ${m % 60}m`;
+    if (h > 0) return `${h}h ${m % 60}m ${s % 60}s`;
+    if (m > 0) return `${m}m ${s % 60}s`;
+    return `${s}s`;
+  }
+
+  /**
+   * v6.2.0: Dynamic config reload (partial)
+   * Allows changing certain config values without restarting:
+   *   - logLevel (0-4)
+   *   - maxAge (ms)
+   *   - debug (boolean)
+   *
+   * NOTE: Changes to maxSize, cacheDir, routing require full restart.
+   */
+  reloadConfig(newConfig = {}) {
+    if (!this._initialized) return;
+
+    if (typeof newConfig.logLevel === "number") {
+      if (this.logger) {
+        this.logger.level = newConfig.logLevel;
+        this.logger.info("Runtime", `Log level changed to ${newConfig.logLevel}`);
+      }
+    }
+
+    if (typeof newConfig.maxAge === "number" && this.storage) {
+      this.storage.maxAge = newConfig.maxAge;
+      if (this.handler && this.handler.cacheConfig) {
+        this.handler.cacheConfig.maxAge = newConfig.maxAge;
+      }
+      if (this.logger) {
+        this.logger.info("Runtime", `MaxAge changed to ${(newConfig.maxAge / 3600000).toFixed(1)}h`);
+      }
+    }
+
+    if (typeof newConfig.debug === "boolean") {
+      if (this.logger) {
+        this.logger.level = newConfig.debug ? 4 : 3;
+        this.logger.info("Runtime", `Debug mode ${newConfig.debug ? "enabled" : "disabled"}`);
+      }
+    }
+  }
+
   startReportTimer(intervalMs = 30000) {
     this.stopReportTimer();
     this._reportInterval = setInterval(() => {
       const report = this.getReport();
       if (this.logger) this.logger.printReport(report);
     }, intervalMs);
-    // Don't hold the process open for reporting alone
     if (this._reportInterval.unref) this._reportInterval.unref();
   }
 
@@ -159,7 +259,6 @@ class EdgeCacheRuntime {
   async shutdown() {
     this.stopReportTimer();
 
-    // Detach all contexts
     for (const [ctx] of this._attachedContexts) {
       try { await this.detach(ctx); } catch (_) {}
     }
@@ -170,7 +269,6 @@ class EdgeCacheRuntime {
       this.logger.info("Runtime", `CDN EdgeProxy v${VERSION} — Final flush & shutdown`);
     }
 
-    // StorageEngine.shutdown() stops IPC poll + stale cleanup intervals, then flushes
     if (this.storage) {
       await this.storage.shutdown();
     }
