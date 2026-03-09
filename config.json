@@ -1,0 +1,53 @@
+{
+  "maxBodySizeMB": 50,
+  "maxTotalSizeMB": 500,
+  "maxEntries": 50000,
+  "defaultTTL": 86400000,
+  "patternLearning": false,
+  "forceCache": true,
+  "dedup": true,
+  "selectiveResourceTypes": [
+    "Image",
+    "Script",
+    "Stylesheet",
+    "Font"
+  ],
+  "onlyMethods": [
+    "GET"
+  ],
+  "skipExtensions": [
+    ".m3u8",
+    ".mpd",
+    ".ts",
+    ".mp4",
+    ".webm",
+    ".mp3",
+    ".m4a"
+  ],
+"skipDomains": [
+    "cryptonice.online",
+    "*.cryptonice.online",
+    "*.doubleclick.net",
+    "*.googlesyndication.com",
+    "*.google-analytics.com",
+    "*.facebook.net"
+],
+  "bypassRequestHeaders": [
+    "authorization",
+    "range"
+  ],
+  "bypassResponseHeaders": [
+    "set-cookie"
+  ],
+  "bypassCacheControl": [
+    "no-store",
+    "private"
+  ],
+  "honorImmutable": true,
+  "storeQueueConcurrency": 8,
+  "evictionHighWatermark": 0.9,
+  "evictionLowWatermark": 0.75,
+  "saveDebounceMs": 5000,
+  "maxSaveIntervalMs": 60000,
+  "singleProcessOnly": true
+}
