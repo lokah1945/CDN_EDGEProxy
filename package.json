@@ -1,17 +1,25 @@
 {
   "name": "cdn-edgeproxy",
-  "version": "4.1.1",
-  "description": "CDN EdgeProxy \u2014 Aggressive Local CDN Cache Engine with Playwright",
-  "main": "index.js",
+  "version": "6.0.0",
+  "description": "Enterprise-grade CDN EdgeProxy for Playwright-based browser automation (QTE). Provides transparent HTTP/1.1 request caching, static asset deduplication, document conditional caching, inter-process cache sharing, and stealth operation with zero ad-network fingerprinting.",
+  "main": "runtime.js",
   "scripts": {
-    "start": "node index.js",
-    "chromium": "node index.js --browser=chromium",
-    "chrome": "node index.js --browser=chrome",
-    "edge": "node index.js --browser=msedge",
-    "firefox": "node index.js --browser=firefox"
+    "test": "node test/smoke.js"
   },
-  "dependencies": {
-    "playwright": "^1.50.0"
+  "keywords": [
+    "cdn",
+    "cache",
+    "playwright",
+    "proxy",
+    "edge",
+    "automation",
+    "qte"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
   },
-  "license": "MIT"
+  "dependencies": {},
+  "_dependenciesComment": "Zero external dependencies — fully self-contained using Node.js built-ins only (fs, path, crypto, fs/promises)"
 }
